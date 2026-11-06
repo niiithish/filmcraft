@@ -460,7 +460,8 @@ fn background_requests_leave_no_decoders_behind() {
     // a clip in use by a monitor
     assert_eq!(index_of(&c[0].frame(&s[0], 10_000).expect("frame")), 10);
     for k in 1..n {
-        assert_eq!(index_of(&with_background(true, || c[k].frame(&s[k], 10_000)).expect("frame")), 10);
+        // a thumbnail shows its GOP's sync picture
+        assert_eq!(index_of(&with_background(true, || c[k].frame(&s[k], 10_000)).expect("frame")), 0);
         assert!(pool.decoders.load(Ordering::Relaxed) <= 2, "{} live decoders after thumbnail {k}", pool.decoders.load(Ordering::Relaxed));
     }
     // the monitor's clip and the last thumbnail keep theirs and carry on without a seek
@@ -476,8 +477,8 @@ fn background_requests_leave_no_decoders_behind() {
     }
     assert_eq!(index_of(&c[n - 1].frame(&s[n - 1], 14_000).expect("frame")), 14);
     assert!(c[n - 1].shared.state.lock().unwrap().decoder.is_some(), "the thumbnails left its decoder");
-    // a cache that lost its decoder still decodes (from the sync sample)
-    assert_eq!(index_of(&with_background(true, || c[1].frame(&s[1], 30_000)).expect("frame")), 30);
+    // a cache that lost its decoder still decodes (the sync sample)
+    assert_eq!(index_of(&with_background(true, || c[1].frame(&s[1], 30_000)).expect("frame")), 0);
 }
 
 #[test]
@@ -485,8 +486,8 @@ fn a_monitor_replaces_a_decoder_made_for_a_thumbnail() {
     use filmcraft_media::cancel::with_background;
     let pool = Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).tiered(RECENT, HARD_DECODERS));
     let (s, c) = (samples(300, 250, 3, false), GopCache::in_pool(None, pool.clone()));
-    assert_eq!(index_of(&with_background(true, || c.frame(&s, 10_000)).expect("frame")), 10);
-    // another thumbnail of the same clip carries on with the thumbnail decoder
+    assert_eq!(index_of(&with_background(true, || c.frame(&s, 10_000)).expect("frame")), 0);
+    // another thumbnail of the same clip carries on with the thumbnail decoder to its exact frame
     assert_eq!(index_of(&with_background(true, || c.frame(&s, 12_000)).expect("frame")), 12);
     assert_eq!(s.resets.load(Ordering::Relaxed), 1);
     // a frame a monitor waits for (not cached: far ahead) is decoded by a full-thread decoder
@@ -1040,4 +1041,22 @@ fn release_idle_empties_idle_caches_and_leaves_one_in_use_alone() {
     pool.release_idle();
     assert_eq!(pool.bytes.load(Ordering::Relaxed), 0);
     assert_eq!(pool.decoders.load(Ordering::Relaxed), 0);
+}
+
+/// A thumbnail decodes its GOP's sync picture, not the GOP up to its frame: the timeline asks for
+/// one per tile of every clip when a project opens, and each used to decode up to a GOP of
+/// full-size pictures. A monitor still gets the exact frame.
+#[test]
+fn a_thumbnail_decodes_only_the_sync_picture_of_its_gop() {
+    use filmcraft_media::cancel::with_background;
+    let pool = Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).tiered(RECENT, HARD_DECODERS));
+    let (s, c) = (samples(300, 30, 3, false), GopCache::in_pool(None, pool.clone()));
+    assert_eq!(index_of(&with_background(true, || c.frame(&s, 58_000)).expect("frame")), 30);
+    let decodes = s.decodes.load(Ordering::Relaxed);
+    assert!(decodes <= 4, "{decodes} samples decoded for one thumbnail (a GOP of 30, decoder delay 3)");
+    // a frame of the same GOP the decoder has passed: the cached sync picture, no decoding
+    assert_eq!(index_of(&with_background(true, || c.frame(&s, 31_000)).expect("frame")), 30);
+    assert_eq!(s.decodes.load(Ordering::Relaxed), decodes);
+    // a monitor gets the exact frame
+    assert_eq!(index_of(&c.frame(&s, 58_000).expect("frame")), 58);
 }

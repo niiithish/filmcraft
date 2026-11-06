@@ -813,6 +813,19 @@ impl GopCache {
             st.background &= background;
             return Ok(Taken { pts: want_pts, frame, raw: st.raw.contains(&want_pts) });
         }
+        // A thumbnail shows the sync picture its frame's GOP starts from: decoding on to the exact
+        // frame costs up to a GOP of full-size pictures (on a 1080×1920 phone clip, about 30 at
+        // 26 ms each through VA-API) for a 160-pixel tile that looks the same, and the timeline
+        // asks for one per tile of every clip when a project opens. A decoder already running
+        // towards the frame in this GOP still goes on to it.
+        let (i, want_pts) = match decode_start(s, i) {
+            k if background && k < i && !(st.decoder.is_some() && st.next != usize::MAX && st.next > k && st.next <= i) => (k, s.pts(k)),
+            _ => (i, want_pts),
+        };
+        if background && let Some(frame) = st.cached(want_pts, draft).cloned() {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(Taken { pts: want_pts, frame, raw: st.raw.contains(&want_pts) });
+        }
         MISSES.fetch_add(1, Ordering::Relaxed);
         if !background {
             st.background = false;
