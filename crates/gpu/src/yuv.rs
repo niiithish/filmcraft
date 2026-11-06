@@ -192,6 +192,7 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(yuv_len(1080, 1920), Some(1080 * 1920 * 3 / 2));
-        assert_eq!(yuv_len(u32::MAX, u32::MAX), Some(u64::from(u32::MAX) * u64::from(u32::MAX) * 3 / 2));
+        // a size whose planes don't fit in u64 is refused, not wrapped
+        assert_eq!(yuv_len(u32::MAX, u32::MAX), None);
     }
 }

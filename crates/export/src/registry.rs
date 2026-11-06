@@ -150,6 +150,11 @@ pub trait FrameRenderer: Send {
         sources: &dyn SourceProvider,
     ) -> Option<filmcraft_render::Image>;
 
+    /// What the renderer's device runs. The export plans with it before taking a renderer
+    /// ([`filmcraft_render::plan::is_cpu_frame`]), so a frame the device can't composite renders
+    /// on the export's own thread instead of on the CPU inside the renderer.
+    fn caps(&self) -> filmcraft_render::plan::DeviceCaps;
+
     /// The frame for an encoder that takes [`EncoderFrame::yuv420`]: composited, flattened over
     /// black and converted to BT.709 limited 8-bit 4:2:0 on the device, so only the planes come
     /// back (3 MB at 1080p instead of a 16 MB float picture), or the picture as `render` gives it

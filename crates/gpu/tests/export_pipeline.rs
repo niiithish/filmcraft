@@ -26,13 +26,20 @@ impl FrameRenderer for GpuFrameRenderer {
     ) -> Option<filmcraft_render::Image> {
         self.0.render(project, seq, t, opts, sources)
     }
+
+    fn caps(&self) -> filmcraft_render::plan::DeviceCaps {
+        self.0.caps()
+    }
 }
 
-fn project(width: u32, height: u32) -> (Arc<filmcraft_project::Project>, filmcraft_project::ItemId, SourceMap) {
-    project_of(Generator::ColorMatte { color: [0.2, 0.5, 0.9, 1.0] }, width, height)
+/// The colour matte on V1, and with `adjusted` an adjustment layer over it on V2 (Proc Amp and
+/// Gaussian Blur, opaque, Normal, full frame: the kind the GPU runs as a `PlanStep::Adjust`).
+fn project_with(width: u32, height: u32, adjusted: bool) -> (Arc<filmcraft_project::Project>, filmcraft_project::ItemId, SourceMap) {
+    project_of(Generator::ColorMatte { color: [0.2, 0.5, 0.9, 1.0] }, width, height, adjusted)
 }
 
-fn project_of(generator: Generator, width: u32, height: u32) -> (Arc<filmcraft_project::Project>, filmcraft_project::ItemId, SourceMap) {
+/// [`project_with`] with another generator on V1.
+fn project_of(generator: Generator, width: u32, height: u32, adjusted: bool) -> (Arc<filmcraft_project::Project>, filmcraft_project::ItemId, SourceMap) {
     let mut p = filmcraft_project::Project::new("x");
     let g = GeneratorSource::new(generator, 320, 180, filmcraft_time::FrameRate::FPS_24, filmcraft_time::Tick(2 * TICKS_PER_SECOND));
     let info = g.info().clone();
@@ -52,7 +59,8 @@ fn project_of(generator: Generator, width: u32, height: u32) -> (Arc<filmcraft_p
         })),
         None,
     );
-    let seq = p.new_sequence("s", SequenceSettings { width, height, frame_rate: filmcraft_time::FrameRate::FPS_24, ..Default::default() }, 1, 1, None);
+    let tracks = if adjusted { 2 } else { 1 };
+    let seq = p.new_sequence("s", SequenceSettings { width, height, frame_rate: filmcraft_time::FrameRate::FPS_24, ..Default::default() }, tracks, 1, None);
     let v = p
         .make_track_item(
             red,
@@ -63,6 +71,18 @@ fn project_of(generator: Generator, width: u32, height: u32) -> (Arc<filmcraft_p
         )
         .unwrap();
     p.sequence_mut(seq).unwrap().video_tracks[0].items.push(v);
+    if adjusted {
+        let rate = filmcraft_time::FrameRate::FPS_24;
+        let a = p.add_item("Adjustment Layer", Label::Lavender, ItemKind::AdjustmentLayer { width, height, rate, duration: rate.tick_of(2) }, None);
+        let mut ti =
+            p.make_track_item(a, TrackKind::Video, filmcraft_time::Tick::ZERO, TimeRange::new(filmcraft_time::Tick::ZERO, rate.tick_of(2)), rate).unwrap();
+        for (id, param, v) in [("proc_amp", "brightness", 25.0), ("gaussian_blur", "blurriness", 6.0)] {
+            let mut e = filmcraft_project::find_effect(id).unwrap().instance();
+            e.param_mut(param).unwrap().value = filmcraft_project::ParamValue::Float(v);
+            ti.effects.insert(0, e);
+        }
+        p.sequence_mut(seq).unwrap().video_tracks[1].items.push(ti);
+    }
     let mut m = SourceMap::default();
     m.0.insert(red, Arc::new(g));
     (Arc::new(p), seq, m)
@@ -74,8 +94,12 @@ fn png(dir: &str, name: &str) -> Vec<u8> {
     std::fs::read(std::env::temp_dir().join(format!("fc-gpu-export-{dir}{index:03}.png"))).unwrap()
 }
 
-fn export_png(dir: &str, gpu: GpuRendering, (w, h): (u32, u32)) {
-    let (p, seq, m) = project(w, h);
+fn export_png(dir: &str, gpu: GpuRendering, size: (u32, u32)) {
+    export_project_png(dir, gpu, size, false);
+}
+
+fn export_project_png(dir: &str, gpu: GpuRendering, (w, h): (u32, u32), adjusted: bool) {
+    let (p, seq, m) = project_with(w, h, adjusted);
     let mut s = ExportSettings {
         format: Format::PngSequence,
         path: std::env::temp_dir().join(format!("fc-gpu-export-{dir}")).to_string_lossy().into_owned(),
@@ -129,6 +153,20 @@ fn gpu_export_matches_cpu_and_counts() {
     }
     let GpuRenderStats { frames, .. } = filmcraft_export::gpu_render_stats();
     assert!(frames >= 8, "gpu frames counted across the parity exports: {frames}");
+
+    // An adjustment layer is composited by the GPU too (a `PlanStep::Adjust`), not handed to the
+    // CPU renderer, and matches the CPU export.
+    let composited = filmcraft_gpu::export_renderer::timing::get().frames;
+    let GpuRenderStats { fallbacks, .. } = filmcraft_export::gpu_render_stats();
+    export_project_png("adj-cpu", GpuRendering::Off, (320, 180), true);
+    export_project_png("adj-gpu", GpuRendering::Auto, (320, 180), true);
+    for f in ["000", "001"] {
+        assert_parity(&png("adj-cpu", &format!("img{f}.png")), &png("adj-gpu", &format!("img{f}.png")), &format!("adjustment layer frame {f}"));
+    }
+    assert_ne!(png("adj-cpu", "img000.png"), png("off-cpu", "img000.png"), "the adjustment layer changes the picture");
+    let gpu = filmcraft_gpu::export_renderer::timing::get().frames - composited;
+    assert_eq!(gpu, 2, "both frames with the adjustment layer composited on the GPU");
+    assert_eq!(filmcraft_export::gpu_render_stats().fallbacks, fallbacks, "no frame with the adjustment layer fell back to the CPU");
 }
 
 /// The 4:2:0 picture the GPU converts for VA-API (`render_yuv420`) must equal the CPU conversion
@@ -147,7 +185,7 @@ fn gpu_yuv420_matches_cpu_conversion() {
         Generator::ColorMatte { color: [0.2, 0.5, 0.9, 1.0] },
     ] {
         let (w, h) = (320usize, 184usize);
-        let (p, seq, m) = project_of(generator.clone(), w as u32, h as u32);
+        let (p, seq, m) = project_of(generator.clone(), w as u32, h as u32, false);
         let t = filmcraft_time::FrameRate::FPS_24.tick_of(1);
         let opts = filmcraft_render::RenderOptions::default();
         let image = gpu.render(&p, seq, t, opts, &m).expect("gpu image");

@@ -286,6 +286,10 @@ impl filmcraft_export::FrameRenderer for GpuFrameRenderer {
             filmcraft_gpu::ExportFrame::Image(img) => filmcraft_export::RenderedFrame::Image(img),
         })
     }
+
+    fn caps(&self) -> filmcraft_render::plan::DeviceCaps {
+        self.0.caps()
+    }
 }
 
 fn register_gpu_frame_renderer() {
