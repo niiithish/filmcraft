@@ -25,7 +25,7 @@ fn project(w: u32, h: u32, frames: i64) -> (Arc<Project>, filmcraft_project::Ite
     let clip = p.add_item(
         &info.name.clone(),
         Label::Iris,
-        ItemKind::Media(MediaClip {
+        ItemKind::Media(Box::new(MediaClip {
             media: MediaRef::Generator(g.generator.clone()),
             info,
             interpret: Default::default(),
@@ -35,7 +35,7 @@ fn project(w: u32, h: u32, frames: i64) -> (Arc<Project>, filmcraft_project::Ite
             offline: false,
             proxy: None,
             identity: None,
-        }),
+        })),
         None,
     );
     let seq = p.new_sequence("s", SequenceSettings { width: w, height: h, frame_rate: rate, ..Default::default() }, 1, 1, None);
@@ -190,11 +190,11 @@ fn a_short_picture_is_an_error_not_a_panic() {
         None => panic!("VA-API declined a plain 640x360 H.264 export"),
     };
     let short = vec![0u8; 640 * 4 * 10];
-    let frame = filmcraft_export::EncoderFrame { width: 640, height: 360, rgba: &short, hdr: None, index: 0 };
+    let frame = filmcraft_export::EncoderFrame { width: 640, height: 360, rgba: &short, hdr: None, index: 0, yuv420: None };
     assert!(enc.encode(&frame).is_err(), "a picture with too few bytes is an export error");
     // the encoder still works afterwards
     let full = vec![128u8; 640 * 360 * 4];
-    let frame = filmcraft_export::EncoderFrame { width: 640, height: 360, rgba: &full, hdr: None, index: 0 };
+    let frame = filmcraft_export::EncoderFrame { width: 640, height: 360, rgba: &full, hdr: None, index: 0, yuv420: None };
     assert_eq!(enc.encode(&frame).unwrap().len(), 1);
 }
 

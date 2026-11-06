@@ -88,7 +88,7 @@ pub const INTERLEAVE: i64 = 16;
 pub const IN_FLIGHT_BUDGET: u64 = 1 << 29;
 
 /// One rendered picture: straight RGBA8, or for HDR exports the encoded R'G'B' floats.
-type Frame = (Vec<u8>, Vec<f32>);
+use crate::pipeline::Frame;
 
 /// Bytes of one [`Frame`] of a `w` x `h` export (RGBA8, or three f32 per pixel for HDR).
 pub(crate) fn frame_bytes(w: u32, h: u32, hdr: bool) -> u64 {
@@ -115,18 +115,26 @@ struct Ahead {
 /// must be rendered again.
 /// `prepare` (the encoder's [`VideoEncoder::prepare_ahead`]) then works on each frame, numbered
 /// from `f0` like [`EncoderFrame::index`].
-fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider, prepare: Option<&PrepareAhead>, f0: i64) -> Option<Vec<Frame>> {
+/// `yuv`: the encoder takes [`EncoderFrame::yuv420`] pictures ([`Pipeline::frame_out`]).
+fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider, prepare: Option<&PrepareAhead>, f0: i64, yuv: bool) -> Option<Vec<Frame>> {
     let pending = AtomicBool::new(false);
     let frames: Vec<Frame> = (f..end)
         .into_par_iter()
         .map(|fi| {
-            let frame = pipe.frame(fi, sources);
+            let frame = pipe.frame_out(fi, sources, yuv);
             if filmcraft_media::pending::take() {
                 pending.store(true, Ordering::Relaxed);
             }
             if let Some(prepare) = prepare {
                 let index = u64::try_from(fi - f0).unwrap_or(u64::MAX);
-                prepare(&EncoderFrame { width: pipe.w, height: pipe.h, rgba: &frame.0, hdr: pipe.hdr_out.then_some(frame.1.as_slice()), index });
+                prepare(&EncoderFrame {
+                    width: pipe.w,
+                    height: pipe.h,
+                    rgba: &frame.rgba,
+                    hdr: pipe.hdr_out.then_some(frame.hdr.as_slice()),
+                    index,
+                    yuv420: frame.yuv420.as_deref(),
+                });
             }
             frame
         })
@@ -548,13 +556,14 @@ impl Exporter {
     /// Encode (and mux) the batch starting at `self.next`, rendering the one after it meanwhile.
     fn step_batch(&mut self, sources: &dyn SourceProvider, progress: &Progress) -> Result<Step> {
         let prepare = self.venc.prepare_ahead();
+        let yuv = self.venc.accepts_yuv420() && self.pipe.yuv_direct();
         let f0 = self.f0;
         let (f, frames) = match self.ahead.take() {
             Some(a) if a.first == self.next => (a.first, a.frames),
             _ => {
                 let (f, end) = (self.next, self.next.saturating_add(self.batch_len()).min(self.f1));
                 let pipe = &self.pipe;
-                match timed(Stage::Render, || render_batch(pipe, f, end, sources, prepare.as_ref(), f0)) {
+                match timed(Stage::Render, || render_batch(pipe, f, end, sources, prepare.as_ref(), f0, yuv)) {
                     Some(frames) => (f, frames),
                     None => return Ok(Step::Pending),
                 }
@@ -582,7 +591,7 @@ impl Exporter {
         let mut encode_done: Option<web_time::Instant> = None;
         let encoded = rayon::in_place_scope(|s| {
             s.spawn(|_| {
-                slot = Some(catch_unwind(AssertUnwindSafe(|| timed(Stage::Render, || render_batch(&pipe, a, b, sources, prepare.as_ref(), f0)))));
+                slot = Some(catch_unwind(AssertUnwindSafe(|| timed(Stage::Render, || render_batch(&pipe, a, b, sources, prepare.as_ref(), f0, yuv)))));
             });
             let r = self.encode_batch(f, frames, sources);
             encode_done = Some(web_time::Instant::now());
@@ -656,15 +665,16 @@ impl Exporter {
         Ok(Encoded::Done)
     }
 
-    fn encode(&mut self, frames: &[(Vec<u8>, Vec<f32>)], f: i64) -> Result<Vec<EncodedPacket>> {
+    fn encode(&mut self, frames: &[Frame], f: i64) -> Result<Vec<EncodedPacket>> {
         let mut packets = Vec::new();
-        for (k, (rgba, hdr)) in frames.iter().enumerate() {
+        for (k, frame) in frames.iter().enumerate() {
             let fr = EncoderFrame {
                 width: self.pipe.w,
                 height: self.pipe.h,
-                rgba,
-                hdr: self.pipe.hdr_out.then_some(hdr.as_slice()),
+                rgba: &frame.rgba,
+                hdr: self.pipe.hdr_out.then_some(frame.hdr.as_slice()),
                 index: (f - self.f0) as u64 + k as u64,
+                yuv420: frame.yuv420.as_deref(),
             };
             packets.extend(self.venc.encode(&fr)?);
         }

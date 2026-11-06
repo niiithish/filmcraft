@@ -443,6 +443,7 @@ fn hevc_slice_bit_fields_match_the_header() {
 /// as the decode layouts above (a C program printing `sizeof` / `offsetof` of each structure and
 /// the constants, compiled against libva 2.23's headers).
 #[test]
+#[allow(clippy::cognitive_complexity)] // one assertion per VA-API struct field
 fn encode_layouts_match_the_header() {
     assert_eq!(VAEntrypointEncSlice as i64, 6, "VAEntrypointEncSlice");
     assert_eq!(VAEntrypointEncSliceLP as i64, 8, "VAEntrypointEncSliceLP");

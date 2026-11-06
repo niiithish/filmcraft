@@ -29,14 +29,12 @@ impl FrameRenderer for GpuFrameRenderer {
 }
 
 fn project(width: u32, height: u32) -> (Arc<filmcraft_project::Project>, filmcraft_project::ItemId, SourceMap) {
+    project_of(Generator::ColorMatte { color: [0.2, 0.5, 0.9, 1.0] }, width, height)
+}
+
+fn project_of(generator: Generator, width: u32, height: u32) -> (Arc<filmcraft_project::Project>, filmcraft_project::ItemId, SourceMap) {
     let mut p = filmcraft_project::Project::new("x");
-    let g = GeneratorSource::new(
-        Generator::ColorMatte { color: [0.2, 0.5, 0.9, 1.0] },
-        320,
-        180,
-        filmcraft_time::FrameRate::FPS_24,
-        filmcraft_time::Tick(2 * TICKS_PER_SECOND),
-    );
+    let g = GeneratorSource::new(generator, 320, 180, filmcraft_time::FrameRate::FPS_24, filmcraft_time::Tick(2 * TICKS_PER_SECOND));
     let info = g.info().clone();
     let red = p.add_item(
         &info.name.clone(),
@@ -131,4 +129,39 @@ fn gpu_export_matches_cpu_and_counts() {
     }
     let GpuRenderStats { frames, .. } = filmcraft_export::gpu_render_stats();
     assert!(frames >= 8, "gpu frames counted across the parity exports: {frames}");
+}
+
+/// The 4:2:0 picture the GPU converts for VA-API (`render_yuv420`) must equal the CPU conversion
+/// of the GPU's own RGBA picture (`over_black_rgba8` then `rgba_to_yuv420_8`), give or take one
+/// code where device float division rounds the last bit the other way.
+#[test]
+fn gpu_yuv420_matches_cpu_conversion() {
+    let Some(mut gpu) = filmcraft_gpu::ExportRenderer::new() else {
+        eprintln!("SKIPPED (gpu yuv420): no adapter");
+        return;
+    };
+    for generator in [
+        Generator::BarsAndTone,
+        Generator::Demo(filmcraft_media::generators::DemoScene::Plasma),
+        Generator::CountingLeader,
+        Generator::ColorMatte { color: [0.2, 0.5, 0.9, 1.0] },
+    ] {
+        let (w, h) = (320usize, 184usize);
+        let (p, seq, m) = project_of(generator.clone(), w as u32, h as u32);
+        let t = filmcraft_time::FrameRate::FPS_24.tick_of(1);
+        let opts = filmcraft_render::RenderOptions::default();
+        let image = gpu.render(&p, seq, t, opts, &m).expect("gpu image");
+        let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        filmcraft_export::rgba_to_yuv420_8(&image.over_black_rgba8(), w, h, &mut y, &mut u, &mut v);
+        let cpu: Vec<u8> = [y, u, v].concat();
+        let Some(filmcraft_gpu::ExportFrame::Yuv420(yuv)) = gpu.render_yuv420(&p, seq, t, opts, &m) else {
+            panic!("{generator:?}: no 4:2:0 picture from the GPU");
+        };
+        assert_eq!(yuv.len(), cpu.len(), "{generator:?}: 4:2:0 size");
+        let worst = yuv.iter().zip(&cpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        let off = yuv.iter().zip(&cpu).filter(|(a, b)| a != b).count();
+        eprintln!("{generator:?}: {off} of {} codes differ, worst {worst}", cpu.len());
+        assert!(worst <= 1, "{generator:?}: GPU 4:2:0 differs by {worst}");
+        assert!(off * 1000 <= cpu.len(), "{generator:?}: {off} codes differ");
+    }
 }

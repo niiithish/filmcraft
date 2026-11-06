@@ -13,7 +13,19 @@ use filmcraft_time::FrameRate;
 use rayon::prelude::*;
 
 use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
-use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
+use crate::{
+    ExportError, ExportSettings, FrameRenderer, GpuRendering, RenderedFrame, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame, yuv420_len,
+};
+
+/// One output frame: straight sRGB RGBA8 (`rgba`), the encoded R'G'B' floats of an HDR export
+/// (`hdr`), or, for an encoder that takes it, the planar BT.709 limited 8-bit 4:2:0 picture the
+/// GPU converted (`yuv420`, with the other two empty).
+#[derive(Default)]
+pub(crate) struct Frame {
+    pub rgba: Vec<u8>,
+    pub hdr: Vec<f32>,
+    pub yuv420: Option<Vec<u8>>,
+}
 
 /// Image overlays originate outside the project and are expanded to f32 working images. This
 /// admits ordinary 4K artwork while keeping both source decode and resampling bounded.
@@ -148,6 +160,10 @@ pub(crate) struct Pipeline {
     /// Free the pool's float images when the export ends: a standalone export, not one part of a
     /// batch (`ExportSettings::part_of_batch`).
     trim_pool: bool,
+    /// The GPU's picture can go to the encoder as it is: a renderer pool, rendered at the output
+    /// size with nothing placed, overlaid, limited, kept transparent or HDR, and a size the GPU
+    /// conversion takes (see [`Pipeline::frame_out`]).
+    yuv_direct: bool,
 }
 
 impl Drop for Pipeline {
@@ -205,12 +221,23 @@ impl Pipeline {
         } else {
             None
         };
+        let plain = geom.content.is_none() && geom.offset == (0, 0) && (w, h) == (r.width, r.height);
+        let untouched = overlay.is_none()
+            && !(effects.name_overlay.enabled && !effects.name_overlay.text.trim().is_empty())
+            && !effects.timecode_overlay.enabled
+            && !effects.video_limiter.enabled;
+        // the GPU conversion writes whole 4-byte words: 8 pixels by 2 rows per invocation
+        let convertible = w % 8 == 0 && h % 2 == 0;
+        let yuv_capable = !hdr_out && !settings.keeps_alpha() && plain && untouched && convertible;
         let renderer = if settings.gpu_rendering == GpuRendering::Off {
             None
         } else {
             // Four renderers: as fast as one per worker (measured on 16 threads, where more only
-            // contend for memory bandwidth in the read-back), with a quarter of the GPU memory.
-            let count = rayon::current_num_threads().clamp(2, 4);
+            // contend for memory bandwidth in the read-back), with a quarter of the GPU memory. A
+            // picture converted to 4:2:0 on the device reads back a fifth of the bytes, so six
+            // keep the GPU busier (Arc B570, 1080×1920: 2.72 s with four, 2.55 s with six).
+            let most = if yuv_capable { 6 } else { 4 };
+            let count = rayon::current_num_threads().clamp(2, most);
             let mut list = Vec::with_capacity(count);
             for _ in 0..count {
                 if let Some(r) = build_frame_renderer() {
@@ -221,7 +248,9 @@ impl Pipeline {
             }
             RendererPool::new(list)
         };
+        let yuv_direct = renderer.is_some() && yuv_capable;
         Ok(Pipeline {
+            yuv_direct,
             renderer,
             seq_rate: q.settings.frame_rate,
             start_tc: q.start_timecode,
@@ -246,6 +275,56 @@ impl Pipeline {
     /// R'G'B' floats (3 per pixel).
     pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
         let t = self.rate.tick_of(f);
+        let img = self.render(t, sources);
+        self.finish(img, t)
+    }
+
+    /// Whether [`Self::frame_out`] can hand the encoder the GPU's 4:2:0 picture directly.
+    pub fn yuv_direct(&self) -> bool {
+        self.yuv_direct
+    }
+
+    /// Output frame `f`; with `yuv` (the encoder takes [`crate::EncoderFrame::yuv420`]) and a
+    /// pipeline that changes nothing after the render ([`Self::yuv_direct`]), a frame the GPU
+    /// composites comes back as planar 4:2:0 converted on the device: no float read-back and no
+    /// CPU colour conversion. Any other frame is RGBA (or HDR floats) as from [`Self::frame`].
+    pub fn frame_out(&self, f: i64, sources: &dyn SourceProvider, yuv: bool) -> Frame {
+        let t = self.rate.tick_of(f);
+        if yuv && self.yuv_direct {
+            let pool = self.renderer.as_ref().filter(|_| !filmcraft_render::plan::is_cpu_frame(&self.project, self.seq, t));
+            if let Some(pool) = pool {
+                let asked = web_time::Instant::now();
+                let got = pool
+                    .with(|r| {
+                        crate::note_lock_wait(asked.elapsed());
+                        r.render_yuv420(&self.project, self.seq, t, self.opts, sources)
+                    })
+                    .flatten();
+                let img = match got {
+                    Some(RenderedFrame::Yuv420(planes)) if yuv420_len(self.w, self.h) == Some(planes.len()) => {
+                        note_gpu_frame();
+                        return Frame { yuv420: Some(planes), ..Frame::default() };
+                    }
+                    Some(RenderedFrame::Image(img)) => {
+                        note_gpu_frame();
+                        img
+                    }
+                    // nothing, or planes of the wrong size: the CPU reference renders the frame
+                    Some(RenderedFrame::Yuv420(_)) | None => {
+                        note_gpu_fallback();
+                        filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources)
+                    }
+                };
+                let (rgba, hdr) = self.finish(img, t);
+                return Frame { rgba, hdr, yuv420: None };
+            }
+        }
+        let (rgba, hdr) = self.frame(f, sources);
+        Frame { rgba, hdr, yuv420: None }
+    }
+
+    /// The rendered picture at `t`: the GPU renderer's, or the CPU reference renderer's.
+    fn render(&self, t: filmcraft_time::Tick, sources: &dyn SourceProvider) -> Image {
         // The registered GPU renderer goes first; `None` (no adapter, a plan the GPU cannot
         // draw, any internal error) falls back to the CPU reference renderer below. A frame the
         // planner hands back as one CPU image anyway (an adjustment layer, a complex transition,
@@ -263,7 +342,7 @@ impl Pipeline {
             }
             None => None,
         };
-        let img = match gpu {
+        match gpu {
             Some(img) => {
                 note_gpu_frame();
                 img
@@ -274,7 +353,11 @@ impl Pipeline {
                 }
                 filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources)
             }
-        };
+        }
+    }
+
+    /// Place, overlay and convert a rendered picture to the encoder's input.
+    fn finish(&self, img: Image, t: filmcraft_time::Tick) -> (Vec<u8>, Vec<f32>) {
         let mut img = self.place(img);
         self.overlays(&mut img, t);
         let lim = &self.effects.video_limiter;

@@ -165,6 +165,48 @@ impl ExportRenderer {
             }
         }
     }
+
+    /// One frame for an encoder that takes planar BT.709 limited 8-bit 4:2:0: composited and
+    /// converted on the device ([`ExportFrame::Yuv420`]), or the picture as [`Self::render`]
+    /// returns it when the frame is a CPU image or a size the conversion does not take. `None`
+    /// when the CPU renderer must render this frame.
+    pub fn render_yuv420(&mut self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Option<ExportFrame> {
+        let plan = plan_frame(project, seq, t, opts, sources);
+        match &plan {
+            FramePlan::Image(img) => Some(ExportFrame::Image(img.clone())),
+            FramePlan::Layers { .. } | FramePlan::Composite { .. } => {
+                if device_failed() {
+                    return None;
+                }
+                let prep = prepare(&plan);
+                if let Some((_, _, planes)) = self.compositor.render_export_yuv420(&plan, Some(&prep)) {
+                    // an error reported while this frame was drawn leaves its pixels untrusted
+                    if device_failed() {
+                        return None;
+                    }
+                    timing::add_frame();
+                    return Some(ExportFrame::Yuv420(planes));
+                }
+                if device_failed() {
+                    return None;
+                }
+                let (w, h, px) = self.compositor.render_export_prepared(&plan, Some(&prep))?;
+                if device_failed() {
+                    return None;
+                }
+                timing::add_frame();
+                Some(ExportFrame::Image(Image { w: w as usize, h: h as usize, px }))
+            }
+        }
+    }
+}
+
+/// What [`ExportRenderer::render_yuv420`] produced.
+pub enum ExportFrame {
+    /// Planar BT.709 limited 8-bit 4:2:0: Y (w×h), then U and V (w/2 × h/2 each).
+    Yuv420(Vec<u8>),
+    /// Premultiplied linear-light RGBA, as [`ExportRenderer::render`] returns it.
+    Image(Image),
 }
 
 #[cfg(test)]

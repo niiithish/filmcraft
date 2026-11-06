@@ -450,8 +450,8 @@ fn gpu_hook_scenarios() {
             "frame {f}: a panicking GPU renderer falls back to the CPU"
         );
     }
-    // at most one panic per pooled renderer (4): none is used again after it panicked
-    assert!(PANICS.load(std::sync::atomic::Ordering::SeqCst) <= 4, "renderer reused after a panic: {}", PANICS.load(std::sync::atomic::Ordering::SeqCst));
+    // at most one panic per pooled renderer (up to 6): none is used again after it panicked
+    assert!(PANICS.load(std::sync::atomic::Ordering::SeqCst) <= 6, "renderer reused after a panic: {}", PANICS.load(std::sync::atomic::Ordering::SeqCst));
 
     // 5. A frame the planner hands back as one CPU image (an adjustment layer over the clip from
     //    frame 12) is rendered by the CPU without taking a pooled renderer: it counts as a
@@ -535,7 +535,7 @@ fn h264_input_converted_ahead_encodes_to_the_same_packets() {
         })
         .collect();
     let s = ExportSettings { format: Format::H264, ..Default::default() };
-    let frame = |i: usize| EncoderFrame { width: w, height: h, rgba: &frames[i], hdr: None, index: i as u64 };
+    let frame = |i: usize| EncoderFrame { width: w, height: h, rgba: &frames[i], hdr: None, index: i as u64, yuv420: None };
     let encode_all = |ahead: bool| -> Vec<Vec<u8>> {
         let mut enc = h264_factory(Format::H264, w, h, FrameRate::FPS_24, &s).unwrap().unwrap();
         if ahead {
@@ -544,7 +544,7 @@ fn h264_input_converted_ahead_encodes_to_the_same_packets() {
                 prepare(&frame(i));
             }
             // a picture of another size under index 5: the encoder converts that one itself
-            prepare(&EncoderFrame { width: w / 2, height: h / 2, rgba: &frames[5][..(w * h) as usize], hdr: None, index: 5 });
+            prepare(&EncoderFrame { width: w / 2, height: h / 2, rgba: &frames[5][..(w * h) as usize], hdr: None, index: 5, yuv420: None });
             // and one it is never asked to encode
             prepare(&EncoderFrame { index: 99, ..frame(0) });
         }

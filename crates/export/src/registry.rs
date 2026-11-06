@@ -24,6 +24,31 @@ pub struct EncoderFrame<'a> {
     pub rgba: &'a [u8],
     pub hdr: Option<&'a [f32]>,
     pub index: u64,
+    /// The picture already as BT.709 limited-range 8-bit 4:2:0, planar (Y `width`×`height`, then
+    /// U and V `width/2`×`height/2` each): what [`crate::rgba_to_yuv420_8`] makes of `rgba`,
+    /// converted on the GPU. Only an encoder whose [`VideoEncoder::accepts_yuv420`] says yes is
+    /// handed one, and `rgba` is empty then; it uses these planes as they are.
+    pub yuv420: Option<&'a [u8]>,
+}
+
+/// Size of the planar 8-bit 4:2:0 picture of [`EncoderFrame::yuv420`] (`None` on overflow).
+pub fn yuv420_len(w: u32, h: u32) -> Option<usize> {
+    let (w, h) = (w as usize, h as usize);
+    let chroma = w.div_ceil(2).checked_mul(h.div_ceil(2))?;
+    w.checked_mul(h)?.checked_add(chroma.checked_mul(2)?)
+}
+
+/// The Y, U and V planes of an [`EncoderFrame::yuv420`] picture, or `None` when `bytes` is not
+/// exactly one `w`×`h` picture.
+pub fn yuv420_planes(bytes: &[u8], w: u32, h: u32) -> Option<(&[u8], &[u8], &[u8])> {
+    if yuv420_len(w, h) != Some(bytes.len()) {
+        return None;
+    }
+    let luma = (w as usize).checked_mul(h as usize)?;
+    let chroma = (w as usize).div_ceil(2).checked_mul((h as usize).div_ceil(2))?;
+    let (y, rest) = bytes.split_at_checked(luma)?;
+    let (u, v) = rest.split_at_checked(chroma)?;
+    Some((y, u, v))
 }
 
 /// Per-picture work an encoder hands to the export's render threads, see
@@ -50,6 +75,13 @@ pub trait VideoEncoder: Send {
     /// itself for a picture that has none; the encoded bytes are the same either way.
     fn prepare_ahead(&self) -> Option<PrepareAhead> {
         None
+    }
+    /// Whether this encoder takes pictures as [`EncoderFrame::yuv420`] (BT.709 limited 8-bit
+    /// 4:2:0) whenever the export can produce them on the GPU, skipping the read-back of the
+    /// float picture and every CPU colour conversion. Each picture still comes as RGBA when the
+    /// GPU did not render it (a CPU frame), so such an encoder must take both.
+    fn accepts_yuv420(&self) -> bool {
+        false
     }
 }
 
@@ -117,6 +149,30 @@ pub trait FrameRenderer: Send {
         opts: filmcraft_render::RenderOptions,
         sources: &dyn SourceProvider,
     ) -> Option<filmcraft_render::Image>;
+
+    /// The frame for an encoder that takes [`EncoderFrame::yuv420`]: composited, flattened over
+    /// black and converted to BT.709 limited 8-bit 4:2:0 on the device, so only the planes come
+    /// back (3 MB at 1080p instead of a 16 MB float picture), or the picture as `render` gives it
+    /// when this renderer cannot convert this frame. `None` as for `render`. The export asks only
+    /// when nothing else needs the picture (no placement, overlays, limiter, alpha or HDR).
+    fn render_yuv420(
+        &mut self,
+        project: &Project,
+        seq: ItemId,
+        t: Tick,
+        opts: filmcraft_render::RenderOptions,
+        sources: &dyn SourceProvider,
+    ) -> Option<RenderedFrame> {
+        self.render(project, seq, t, opts, sources).map(RenderedFrame::Image)
+    }
+}
+
+/// What [`FrameRenderer::render_yuv420`] produced.
+pub enum RenderedFrame {
+    /// Planar BT.709 limited 8-bit 4:2:0 at the render size ([`yuv420_len`] bytes).
+    Yuv420(Vec<u8>),
+    /// The premultiplied linear-light picture, as [`FrameRenderer::render`] returns it.
+    Image(filmcraft_render::Image),
 }
 
 /// Builds the frame renderer for one export, or `None` when this host cannot (no adapter).

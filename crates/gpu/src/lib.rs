@@ -44,7 +44,8 @@ pub mod fx;
 pub mod lut;
 pub mod mask;
 mod transition;
-pub use export_renderer::ExportRenderer;
+mod yuv;
+pub use export_renderer::{ExportFrame, ExportRenderer};
 pub use lut::GpuLut;
 pub use mask::GpuMask;
 
@@ -90,6 +91,8 @@ pub struct GpuCompositor {
     fx: Option<fx::FxStage>,
     transition: transition::PushStage,
     transition_inputs: [Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>; 2],
+    /// The 4:2:0 output stage for export, made on first use (`Some(None)`: the device cannot).
+    yuv: Option<Option<yuv::YuvStage>>,
     pub gpu_transitions: u64,
     pub cpu_transitions: u64,
     /// Total bytes uploaded (stats).
@@ -424,6 +427,7 @@ impl GpuCompositor {
             fx,
             transition: transition::PushStage::new(device),
             transition_inputs: [None, None],
+            yuv: None,
             gpu_transitions: 0,
             cpu_transitions: 0,
             uploaded_bytes: 0,
@@ -996,6 +1000,50 @@ impl GpuCompositor {
     /// Run the effect stage of a layer alone: `frame` decoded into its working image and `fx`
     /// applied, read back as linear premultiplied RGBA f32 (what `LayerFx` ops produce on the
     /// CPU from the same frame). None when the working image does not fit in a texture.
+    /// [`Self::render_export_prepared`] for an encoder that takes planar BT.709 limited 8-bit
+    /// 4:2:0: the frame is composited, then converted on the device, and only the planes are read
+    /// back (`(w, h, planes)`). `None` when the device has no conversion stage or the frame's size
+    /// is one it does not take (width not a multiple of 8, odd height): the caller renders the
+    /// frame some other way.
+    pub fn render_export_yuv420(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>) -> Option<(u32, u32, Vec<u8>)> {
+        let (w, h) = match plan {
+            FramePlan::Layers { width, height, .. } | FramePlan::Composite { width, height, .. } => (u32::try_from(*width).ok()?, u32::try_from(*height).ok()?),
+            // the CPU already made the picture: nothing to composite here
+            FramePlan::Image(_) => return None,
+        };
+        if !yuv::takes(&self.device, w, h) {
+            return None;
+        }
+        if self.yuv.is_none() {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let stage = yuv::YuvStage::new(&self.device, &self.queue);
+            self.yuv = Some(match poll_now(scope.pop()) {
+                Some(None) => Some(stage),
+                Some(Some(e)) => {
+                    log::warn!("GPU 4:2:0 export conversion unavailable on this device: {e}");
+                    None
+                }
+                None => None,
+            });
+        }
+        let t = std::time::Instant::now();
+        self.render_plan(plan, prep, true, false);
+        let (_, view, size) = self.accum.as_ref()?;
+        if *size != (w, h) {
+            return None;
+        }
+        let view = view.clone();
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-export-yuv") });
+        let stage = self.yuv.as_mut()?.as_mut()?;
+        let len = stage.record(&self.device, &self.queue, &mut enc, &view, w, h)?;
+        self.queue.submit([enc.finish()]);
+        export_renderer::timing::add_submit(t.elapsed());
+        let t = std::time::Instant::now();
+        let planes = stage.read(&self.device, len)?;
+        export_renderer::timing::add_map_wait(t.elapsed());
+        Some((w, h, planes))
+    }
+
     pub fn effect_image(&mut self, frame: &VideoFrame, fx: &filmcraft_render::plan::LayerFx) -> Option<(u32, u32, Vec<f32>)> {
         let key = self.upload(frame, None);
         let src = self.src_info(frame, key)?;

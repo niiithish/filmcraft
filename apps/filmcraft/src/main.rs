@@ -439,6 +439,20 @@ impl filmcraft_export::FrameRenderer for GpuFrameRenderer {
     ) -> Option<filmcraft_render::Image> {
         self.0.render(project, seq, t, opts, sources)
     }
+
+    fn render_yuv420(
+        &mut self,
+        project: &filmcraft_project::Project,
+        seq: filmcraft_project::ItemId,
+        t: filmcraft_time::Tick,
+        opts: filmcraft_render::RenderOptions,
+        sources: &dyn filmcraft_render::SourceProvider,
+    ) -> Option<filmcraft_export::RenderedFrame> {
+        Some(match self.0.render_yuv420(project, seq, t, opts, sources)? {
+            filmcraft_gpu::ExportFrame::Yuv420(planes) => filmcraft_export::RenderedFrame::Yuv420(planes),
+            filmcraft_gpu::ExportFrame::Image(img) => filmcraft_export::RenderedFrame::Image(img),
+        })
+    }
 }
 
 fn register_gpu_frame_renderer() {

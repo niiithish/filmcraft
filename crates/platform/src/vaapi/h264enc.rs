@@ -54,7 +54,8 @@ fn va_profile(p: H264Profile) -> ffi::VAProfile {
     match p {
         H264Profile::Baseline => ffi::VAProfileH264ConstrainedBaseline,
         H264Profile::Main => ffi::VAProfileH264Main,
-        H264Profile::High => ffi::VAProfileH264High,
+        // High 10 never reaches the GPU: `config` declines it (8-bit encoder only).
+        H264Profile::High | H264Profile::High10 => ffi::VAProfileH264High,
     }
 }
 
@@ -66,6 +67,9 @@ pub(crate) fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &Export
     }
     if s.signal.is_hdr() {
         return Err("HDR".into());
+    }
+    if s.h264_profile == H264Profile::High10 {
+        return Err("High 10 (10-bit) output".into());
     }
     if s.bitrate_mode == BitrateMode::Vbr2Pass || !matches!(s.h264_pass, H264Pass::Single) {
         return Err("two-pass VBR".into());
@@ -94,7 +98,8 @@ pub(crate) fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &Export
     let keyint = s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (fps * 2.0).round().max(1.0) as u32).min(10_000);
     let max_kbps = if cbr { kbps } else { s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps.saturating_mul(3) / 2) };
     let high = s.h264_profile == H264Profile::High;
-    let auto = filmcraft_h264enc::nal::pick_level(w.div_ceil(16), h.div_ceil(16), fps, 1, Some(max_kbps), high);
+    let br_factor = if high { 1250 } else { 1000 };
+    let auto = filmcraft_h264enc::nal::pick_level(w.div_ceil(16), h.div_ceil(16), fps, 1, Some(max_kbps), br_factor);
     let level = s.h264_level.map_or(auto, |l| filmcraft_h264enc::nal::level_at_least(l, auto));
     let sar = s.pixel_aspect.map_or((1, 1), |(n, d)| (n.clamp(1, 65535) as u16, d.clamp(1, 65535) as u16));
     Ok(Config { entrypoint: caps.entrypoint, width: w, height: h, fps: (num, den), kbps, max_kbps, cbr, keyint, profile: s.h264_profile, level, sar })
@@ -176,6 +181,7 @@ fn parameter_sets(cfg: &Config, coded_w: u32, coded_h: u32) -> (Vec<u8>, Vec<u8>
         H264Profile::Baseline => (66u8, 0xC0u8),
         H264Profile::Main => (77, 0x40),
         H264Profile::High => (100, 0x00),
+        H264Profile::High10 => (110, 0x00),
     };
     let color = filmcraft_h264enc::ColorConfig::default();
     let sps = nal::Sps {
@@ -186,6 +192,7 @@ fn parameter_sets(cfg: &Config, coded_w: u32, coded_h: u32) -> (Vec<u8>, Vec<u8>
         height_mbs: coded_h / 16,
         crop_right: coded_w.saturating_sub(cfg.width),
         crop_bottom: coded_h.saturating_sub(cfg.height),
+        bit_depth: 8,
         log2_max_frame_num: LOG2_MAX_FRAME_NUM,
         log2_max_poc_lsb: LOG2_MAX_POC_LSB,
         max_num_ref_frames: 1,
@@ -397,12 +404,19 @@ impl VideoEncoder for VaH264Encoder {
             return Err(ExportError::Encode(format!("VA-API: a {}x{} picture for a {}x{} encoder", f.width, f.height, self.cfg.width, self.cfg.height)));
         }
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
-        if f.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
-            return Err(ExportError::Encode(format!("VA-API: a {}-byte RGBA picture for {w}x{h}", f.rgba.len())));
-        }
-        filmcraft_export::rgba_to_yuv420_8(f.rgba, w, h, &mut self.y, &mut self.u, &mut self.v);
         let fail = |e: String| ExportError::Encode(format!("VA-API: {e} (turn Export ▸ Hardware encoding off to use the software encoder)"));
-        self.session.upload(&self.y, &self.u, &self.v, w, h).map_err(fail)?;
+        if let Some(planes) = f.yuv420 {
+            // converted on the GPU already: the planes go to the surface as they are
+            let (y, u, v) = filmcraft_export::yuv420_planes(planes, f.width, f.height)
+                .ok_or_else(|| ExportError::Encode(format!("VA-API: a {}-byte 4:2:0 picture for {w}x{h}", planes.len())))?;
+            self.session.upload(y, u, v, w, h).map_err(fail)?;
+        } else {
+            if f.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
+                return Err(ExportError::Encode(format!("VA-API: a {}-byte RGBA picture for {w}x{h}", f.rgba.len())));
+            }
+            filmcraft_export::rgba_to_yuv420_8(f.rgba, w, h, &mut self.y, &mut self.u, &mut self.v);
+            self.session.upload(&self.y, &self.u, &self.v, w, h).map_err(fail)?;
+        }
         let (bytes, key) = self.encode_picture().map_err(fail)?;
         let data = sample(&bytes, key);
         if data.is_empty() {
@@ -414,6 +428,11 @@ impl VideoEncoder for VaH264Encoder {
 
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         Ok(Vec::new())
+    }
+
+    /// BT.709 limited 8-bit 4:2:0 is the surface format this encoder converts RGBA to itself.
+    fn accepts_yuv420(&self) -> bool {
+        true
     }
 }
 
