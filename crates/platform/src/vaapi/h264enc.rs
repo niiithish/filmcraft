@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(sps[1], 100, "High profile_idc");
         assert_eq!(pps[0] & 0x1f, 8);
         // our own decoder's parser reads them: 1920x1080 after cropping
-        let parsed = filmcraft_h264::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(&sps[1..])).unwrap();
+        let parsed = craft_video::h264::decode::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(&sps[1..])).unwrap();
         assert_eq!((parsed.width(), parsed.height()), (1920, 1088), "coded size");
         assert_eq!(parsed.crop_rect(), (0, 0, 1920, 1080), "cropped to the picture");
         assert_eq!(parsed.max_frame_num(), 1 << LOG2_MAX_FRAME_NUM);
