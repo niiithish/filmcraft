@@ -57,6 +57,8 @@ const OP_BOKEH_BOOST: u32 = 33;
 const OP_BOKEH: u32 = 34;
 const OP_BOKEH_UP: u32 = 35;
 const OP_THREE_WAY: u32 = 36;
+const OP_ULTRA_KEY: u32 = 37;
+const OP_LUMETRI_CURVES: u32 = 38;
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -105,6 +107,8 @@ struct Step {
     /// Bokeh Blur's gather: its kernel (`filmcraft_render::vfx::bokeh_kernel`), read as the aux
     /// texture.
     kernel: Vec<(i32, i32, f32)>,
+    /// Lumetri's RGB curves (`LumetriCurves::texels`), read as the aux texture.
+    table: Vec<[f32; 4]>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -112,7 +116,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new() }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), table: Vec::new() }
 }
 
 /// Texels a row of a kernel texture holds.
@@ -121,10 +125,17 @@ const KERNEL_ROW: usize = 64;
 /// Bokeh Blur's kernel as a texture: entry `k` at (`k` % [`KERNEL_ROW`], `k` / [`KERNEL_ROW`]),
 /// (dx, dy, weight, 0). At most 2500 entries: 40 rows.
 fn kernel_texture(device: &wgpu::Device, queue: &wgpu::Queue, kernel: &[(i32, i32, f32)]) -> wgpu::TextureView {
-    let rows = kernel.len().div_ceil(KERNEL_ROW).max(1);
+    let entries: Vec<[f32; 4]> = kernel.iter().map(|&(dx, dy, wt)| [dx as f32, dy as f32, wt, 0.0]).collect();
+    table_texture(device, queue, &entries)
+}
+
+/// A table of texels as a texture, [`KERNEL_ROW`] a row: entry `k` at (`k` % [`KERNEL_ROW`],
+/// `k` / [`KERNEL_ROW`]).
+fn table_texture(device: &wgpu::Device, queue: &wgpu::Queue, entries: &[[f32; 4]]) -> wgpu::TextureView {
+    let rows = entries.len().div_ceil(KERNEL_ROW).max(1);
     let mut texels = vec![0f32; rows * KERNEL_ROW * 4];
-    for (t, &(dx, dy, wt)) in texels.as_chunks_mut::<4>().0.iter_mut().zip(kernel) {
-        *t = [dx as f32, dy as f32, wt, 0.0];
+    for (t, e) in texels.as_chunks_mut::<4>().0.iter_mut().zip(entries) {
+        *t = *e;
     }
     let size = wgpu::Extent3d { width: KERNEL_ROW as u32, height: rows as u32, depth_or_array_layers: 1 };
     let t = device.create_texture(&wgpu::TextureDescriptor {
@@ -282,6 +293,7 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             vround,
             vfeather,
             aspect,
+            curves,
             ..
         } => {
             let ge = [gains[0] * exposure, gains[1] * exposure, gains[2] * exposure];
@@ -320,6 +332,37 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 0.0,
             ];
             out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
+            if let Some(c) = curves {
+                let mut s = step(OP_LUMETRI_CURVES, [c.mask(), filmcraft_render::gpufx::LumetriCurves::N as u32, 0, 0], &[]);
+                s.table = c.texels();
+                out.push(s);
+            }
+        }
+        FxOp::UltraKey(uk) => {
+            let k = uk.k;
+            let p = [
+                k[0],
+                k[1],
+                k[2],
+                uk.kmag2, //
+                uk.gain,
+                uk.highlight,
+                uk.shadow,
+                uk.tol, //
+                uk.pedestal,
+                uk.contrast,
+                uk.mid,
+                uk.spill, //
+                uk.desat,
+                uk.range,
+                uk.sluma,
+                0.0, //
+                uk.cc[0],
+                uk.cc[1],
+                uk.cc[2],
+                0.0,
+            ];
+            out.push(step(OP_ULTRA_KEY, [uk.output, uk.dom as u32, uk.cc_on as u32, 0], &p));
         }
     }
     out
@@ -495,7 +538,11 @@ impl FxStage {
             }
             let keep = if s.unsharp_blur || s.combine { orig } else { None };
             let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
-            let kernel = (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel));
+            let kernel = if !s.kernel.is_empty() {
+                Some(kernel_texture(device, queue, &s.kernel))
+            } else {
+                (!s.table.is_empty()).then(|| table_texture(device, queue, &s.table))
+            };
             let aux = match (s.combine, orig, &kernel) {
                 (true, Some(o), _) => views.get(o)?,
                 (_, _, Some(k)) => k,

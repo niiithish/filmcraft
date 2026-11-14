@@ -29,6 +29,55 @@ pub struct Resample {
     pub opacity: f32,
 }
 
+/// Lumetri's RGB curves as `effects::curve_lut` tables of [`LumetriCurves::N`] entries (None: an
+/// identity curve, skipped). The GPU reads them as one table of (luma, red, green, blue) texels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LumetriCurves {
+    pub luma: Option<Vec<f32>>,
+    pub red: Option<Vec<f32>>,
+    pub green: Option<Vec<f32>>,
+    pub blue: Option<Vec<f32>>,
+}
+
+impl LumetriCurves {
+    /// Entries per table (as `effects::lumetri_advanced`).
+    pub const N: usize = crate::effects::LUMETRI_CURVE_N;
+
+    /// The curves of an SDR grading signal (`effects::lumetri_advanced`'s order: luma, then each
+    /// channel).
+    pub fn apply(&self, mut v: [f32; 3]) -> [f32; 3] {
+        use crate::effects::sample_curve_lut as s;
+        if let Some(l) = &self.luma {
+            v = v.map(|q| s(l, q));
+        }
+        if let Some(l) = &self.red {
+            v[0] = s(l, v[0]);
+        }
+        if let Some(l) = &self.green {
+            v[1] = s(l, v[1]);
+        }
+        if let Some(l) = &self.blue {
+            v[2] = s(l, v[2]);
+        }
+        v
+    }
+
+    /// Bit k set: table k (luma, red, green, blue) is present.
+    pub fn mask(&self) -> u32 {
+        [&self.luma, &self.red, &self.green, &self.blue].iter().enumerate().fold(0, |m, (k, c)| if c.is_some() { m | 1 << k } else { m })
+    }
+
+    /// Texel k: entry k of each table (0 where absent).
+    pub fn texels(&self) -> Vec<[f32; 4]> {
+        let at = |c: &Option<Vec<f32>>, k: usize| c.as_ref().and_then(|l| l.get(k)).copied().unwrap_or(0.0);
+        (0..Self::N).map(|k| [at(&self.luma, k), at(&self.red, k), at(&self.green, k), at(&self.blue, k)]).collect()
+    }
+
+    fn finite(&self) -> bool {
+        [&self.luma, &self.red, &self.green, &self.blue].iter().all(|c| c.as_ref().is_none_or(|l| l.len() == Self::N && l.iter().all(|v| v.is_finite())))
+    }
+}
+
 /// One evaluated effect.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FxOp {
@@ -218,7 +267,11 @@ pub enum FxOp {
         vfeather: f32,
         aspect: f32,
         gpu_capable: bool,
+        /// Color Grading's RGB curves (Curves ▸ RGB Curves), run after the basic pass.
+        curves: Option<std::sync::Arc<LumetriCurves>>,
     },
+    /// Ultra Key without the blurring cleanup stages (Choke and Soften at 0).
+    UltraKey(crate::vfx::UltraKey),
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -259,6 +312,7 @@ pub const GPU_EFFECTS: &[&str] = &[
     "vignette",
     "video_limiter",
     "lumetri",
+    "ultra_key",
 ];
 
 /// `Image::transformed` without the mip path: the destination rectangle it writes and the inverse.
@@ -596,12 +650,16 @@ impl FxOp {
                 let sharpen = if creative_on { f(e, "sharpen", cx) / 100.0 } else { 0.0 };
 
                 let curves_on = on(e, "curves_on");
-                let has_curves = curves_on && {
-                    ["curve_luma", "curve_red", "curve_green", "curve_blue"].iter().any(|id| curve_param(e, id).is_some_and(|c| !is_identity_curve(&c)))
-                        || ["hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"]
-                            .iter()
-                            .any(|id| curve_param(e, id).is_some_and(|c| !c.is_empty()))
-                };
+                // RGB curves run on the GPU (a table each); the HSL curves keep the layer on the CPU
+                let has_curves = curves_on
+                    && ["hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"]
+                        .iter()
+                        .any(|id| curve_param(e, id).is_some_and(|c| !c.is_empty()));
+                let rgb_lut =
+                    |id: &str| curve_param(e, id).filter(|c| curves_on && !is_identity_curve(c)).map(|c| crate::effects::curve_lut(&c, LumetriCurves::N));
+                let rgb_curves =
+                    LumetriCurves { luma: rgb_lut("curve_luma"), red: rgb_lut("curve_red"), green: rgb_lut("curve_green"), blue: rgb_lut("curve_blue") };
+                let curves = (rgb_curves.mask() != 0).then(|| std::sync::Arc::new(rgb_curves));
 
                 let wheels_on = on(e, "wheels_on");
                 let has_wheels = wheels_on && {
@@ -657,7 +715,15 @@ impl FxOp {
                     vfeather,
                     aspect,
                     gpu_capable,
+                    curves,
                 }
+            }
+            "ultra_key" => {
+                let uk = crate::vfx::UltraKey::eval(e, cx);
+                if !uk.per_pixel() {
+                    return None;
+                }
+                FxOp::UltraKey(uk)
             }
             _ => return None,
         })
@@ -706,13 +772,43 @@ impl FxOp {
             FxOp::AlphaAdjust { opacity, .. } => opacity.is_finite(),
             FxOp::Vignette { amount, midpoint, roundness, feather, target } => fin(&[*amount, *midpoint, *roundness, *feather]) && fin(target),
             FxOp::VideoLimiter { max, comp, axis, warning_color, .. } => *axis <= 3 && max.is_finite() && comp.is_finite() && fin(warning_color),
-            FxOp::Lumetri { gains, exposure, contrast, hl, sh, wh, bl, sat, faded, vib, st, ht, va, vmid, vround, vfeather, aspect, gpu_capable, .. } => {
+            FxOp::Lumetri {
+                gains,
+                exposure,
+                contrast,
+                hl,
+                sh,
+                wh,
+                bl,
+                sat,
+                faded,
+                vib,
+                st,
+                ht,
+                va,
+                vmid,
+                vround,
+                vfeather,
+                aspect,
+                gpu_capable,
+                curves,
+                ..
+            } => {
                 *gpu_capable
+                    && curves.as_ref().is_none_or(|c| c.finite())
                     && fin(gains)
                     && fin(&[*exposure, *contrast, *hl, *sh, *wh, *bl, *sat, *faded, *vib])
                     && fin(st)
                     && fin(ht)
                     && fin(&[*va, *vmid, *vround, *vfeather, *aspect])
+            }
+            FxOp::UltraKey(u) => {
+                u.per_pixel()
+                    && u.output <= 2
+                    && u.dom <= 2
+                    && fin(&u.k)
+                    && fin(&u.cc)
+                    && fin(&[u.kmag2, u.gain, u.highlight, u.shadow, u.tol, u.pedestal, u.contrast, u.mid, u.spill, u.desat, u.range, u.sluma])
             }
         }
     }
@@ -1062,6 +1158,7 @@ impl FxOp {
                 vround,
                 vfeather,
                 aspect,
+                curves,
                 ..
             } => {
                 let gains = *gains;
@@ -1121,6 +1218,17 @@ impl FxOp {
                         v = v.map(|q| if va < 0.0 { q * k.max(0.0) } else { q + (1.0 - q) * (k - 1.0) });
                     }
                     dec(v)
+                });
+                if let Some(cv) = curves {
+                    img.map_rgb(|c, _, _| dec(cv.apply(enc(c))));
+                }
+            }
+            FxOp::UltraKey(uk) => {
+                let uk = *uk;
+                img.px.par_chunks_mut(4).for_each(|p| {
+                    let px = [p[0], p[1], p[2], p[3]];
+                    let o = uk.finish(px, uk.contrasted(uk.matte(px)));
+                    p.copy_from_slice(&o);
                 });
             }
         }

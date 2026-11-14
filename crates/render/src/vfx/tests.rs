@@ -1593,3 +1593,60 @@ fn lengths_past_the_picture_keep_their_fade_and_weighting() {
     let (glint_32, glint_320) = (total(&render("glint", 32.0)), total(&render("glint", 320.0)));
     assert!((glint_32 - glint_320).abs() > 0.01 * glint_32.abs(), "glint weighting follows the requested length: {glint_32} vs {glint_320}");
 }
+
+/// The GPU effect stage runs Ultra Key as `FxOp::UltraKey` (the shader mirrors its `apply`), so
+/// that op must match the CPU keyer exactly, partial alpha included; Choke and Soften blur the
+/// matte, so those settings get no op and the layer stays on the CPU.
+#[test]
+fn ultra_key_gpu_op_matches_the_cpu_keyer() {
+    use crate::gpufx::FxOp;
+    let mut img = picture(53, 29);
+    for (i, p) in img.px.chunks_mut(4).enumerate() {
+        let a = [1.0, 0.5, 0.0, 0.2][i % 4];
+        p.iter_mut().for_each(|v| *v *= a);
+    }
+    let custom = |e: &mut EffectInstance| {
+        set(e, "setting", ParamValue::Choice(3));
+        for (n, v) in [
+            ("transparency", 70.0),
+            ("highlight", 40.0),
+            ("shadow", 80.0),
+            ("tolerance", 20.0),
+            ("pedestal", 30.0),
+            ("contrast", 40.0),
+            ("spill", 90.0),
+            ("range", 20.0),
+        ] {
+            setf(e, n, v);
+        }
+    };
+    for (key, output, cc, cust) in
+        [([0.0f32, 0.71, 0.35], 0u32, false, false), ([0.1, 0.25, 0.9], 1, true, true), ([0.9, 0.2, 0.1], 2, true, false), ([0.2, 0.8, 0.3], 0, true, true)]
+    {
+        let mut e = inst("ultra_key");
+        set(&mut e, "key_color", ParamValue::Color([key[0], key[1], key[2], 1.0]));
+        set(&mut e, "output", ParamValue::Choice(output));
+        if cust {
+            custom(&mut e);
+        }
+        if cc {
+            setf(&mut e, "cc_saturation", 140.0);
+            setf(&mut e, "cc_hue", -30.0);
+        }
+        let cpu = run("ultra_key", &e, &img, &cx());
+        let op = FxOp::eval(&e, &cx(), img.w, img.h).expect("Ultra Key without Choke / Soften has a GPU op");
+        assert!(op.gpu_ok());
+        let mut via_op = img.clone();
+        op.apply(&mut via_op);
+        assert_eq!(cpu.px, via_op.px, "key {key:?} output {output}");
+    }
+    for setting in [1, 2] {
+        let mut e = inst("ultra_key");
+        set(&mut e, "setting", ParamValue::Choice(setting));
+        assert!(FxOp::eval(&e, &cx(), 8, 8).is_none(), "preset {setting} blurs the matte");
+    }
+    let mut e = inst("ultra_key");
+    custom(&mut e);
+    setf(&mut e, "choke", 5.0);
+    assert!(FxOp::eval(&e, &cx(), 8, 8).is_none(), "Choke blurs the matte");
+}

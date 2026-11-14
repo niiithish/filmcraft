@@ -55,6 +55,8 @@ const OP_BOKEH_BOOST: u32 = 33u;
 const OP_BOKEH: u32 = 34u;
 const OP_BOKEH_UP: u32 = 35u;
 const OP_THREE_WAY: u32 = 36u;
+const OP_ULTRA_KEY: u32 = 37u;
+const OP_LUMETRI_CURVES: u32 = 38u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -646,6 +648,114 @@ fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
 }
 
 // One output pixel of every op but the running-sum box blur.
+// `vfx::UltraKey` (Choke and Soften at 0): p0 = key Y'CbCr + |key chroma|², p1 = gain, highlight,
+// shadow, tolerance, p2 = pedestal, contrast, mid point, spill, p3 = desaturate, range, spill luma,
+// p4 = colour correction (saturation, hue in turns, luminance); i1 = output, dominant channel,
+// colour correction on.
+fn ycbcr709(c: vec3<f32>) -> vec3<f32> {
+    let kr = 0.2126;
+    let kb = 0.0722;
+    let kg = 1.0 - kr - kb;
+    let y = kr * c.x + kg * c.y + kb * c.z;
+    return vec3(y, (c.z - y) / (2.0 * (1.0 - kb)), (c.x - y) / (2.0 * (1.0 - kr)));
+}
+
+fn ultra_key_matte(o: vec4<f32>) -> f32 {
+    if o.a <= 1e-6 {
+        return 0.0;
+    }
+    let k = u.p0.xyz;
+    let kmag2 = u.p0.w;
+    let y = ycbcr709(enc(o.rgb / o.a));
+    let proj = (y.y * k.y + y.z * k.z) / kmag2;
+    let d1 = y.y - proj * k.y;
+    let d2 = y.z - proj * k.z;
+    let perp = sqrt(d1 * d1 + d2 * d2) / sqrt(kmag2);
+    let keyness = clamp(proj, 0.0, 1.5) * (1.0 - smoothstep_fx(0.0, u.p1.w, perp));
+    var m = clamp(1.0 - keyness * u.p1.x, 0.0, 1.0);
+    m += max(y.x - k.x, 0.0) * u.p1.y * 2.0 * min(keyness, 1.0);
+    m += max(k.x - y.x, 0.0) * u.p1.z * 2.0 * min(keyness, 1.0);
+    let ped = u.p2.x;
+    var a = clamp((clamp(m, 0.0, 1.0) - ped) / (1.0 - ped), 0.0, 1.0);
+    let contrast = u.p2.y;
+    if contrast > 0.0 {
+        let g = 1.0 + contrast * 4.0;
+        a = clamp((a - u.p2.z) * g + u.p2.z, 0.0, 1.0);
+    }
+    return a;
+}
+
+fn ultra_key(o: vec4<f32>) -> vec4<f32> {
+    let a = ultra_key_matte(o);
+    let src_a = o.a;
+    let dom = i32(u.i1.y);
+    var v = enc(select(o.rgb / o.a, vec3(0.0), o.a <= 1e-6));
+    let o1 = v[(dom + 1) % 3];
+    let o2 = v[(dom + 2) % 3];
+    let range = u.p3.y;
+    let limit = max(o1, o2) * (1.0 - range) + (o1 + o2) * 0.5 * range;
+    let excess = max(v[dom] - limit, 0.0);
+    let spill = u.p2.w;
+    if excess > 0.0 && spill > 0.0 {
+        let l0 = luma709(v);
+        v[dom] -= excess * spill;
+        let lm = luma709(v);
+        v = vec3(lm) + (v - vec3(lm)) * (1.0 - u.p3.x * min(excess * 4.0, 1.0));
+        v += vec3((l0 - lm) * u.p3.z);
+    }
+    if u.i1.z != 0u {
+        var h = rgb_to_hsl(clamp(v, vec3(0.0), vec3(1.0)));
+        h.x = fract_euclid(h.x + u.p4.y);
+        h.y = clamp(h.y * u.p4.x, 0.0, 1.0);
+        h.z = clamp(h.z * u.p4.z, 0.0, 1.0);
+        v = hsl_to_rgb(h.x, h.y, h.z);
+    }
+    let l = dec(v);
+    switch u.i1.x {
+        case 1u: {
+            let g = srgb_to_linear1(a);
+            return vec4(vec3(g * src_a), src_a);
+        }
+        case 2u: {
+            return vec4(l * src_a, src_a);
+        }
+        default: {
+            let na = a * src_a;
+            return vec4(l * na, na);
+        }
+    }
+}
+
+// Lumetri's RGB curves (`gpufx::LumetriCurves`): i1.y entries in aux, 64 a row, each (luma, red,
+// green, blue); bit k of i1.x says table k is present.
+fn curve_at(ch: i32, x: f32) -> f32 {
+    let last = i32(u.i1.y) - 1;
+    let p = clamp(x, 0.0, 1.0) * f32(last);
+    let i = min(i32(p), last);
+    let j = min(i + 1, last);
+    let a = textureLoad(aux, vec2(i % 64, i / 64), 0)[ch];
+    let b = textureLoad(aux, vec2(j % 64, j / 64), 0)[ch];
+    return a + (b - a) * (p - f32(i));
+}
+
+fn lumetri_curves(c: vec3<f32>) -> vec3<f32> {
+    var v = enc(c);
+    let m = u.i1.x;
+    if (m & 1u) != 0u {
+        v = vec3(curve_at(0, v.x), curve_at(0, v.y), curve_at(0, v.z));
+    }
+    if (m & 2u) != 0u {
+        v.x = curve_at(1, v.x);
+    }
+    if (m & 4u) != 0u {
+        v.y = curve_at(2, v.y);
+    }
+    if (m & 8u) != 0u {
+        v.z = curve_at(3, v.z);
+    }
+    return dec(v);
+}
+
 fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
     let s = size();
     let pc = vec2<f32>(p) + 0.5;
@@ -821,6 +931,16 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let res = vec3(enc_to_linear_limiter(out_enc.x), enc_to_linear_limiter(out_enc.y), enc_to_linear_limiter(out_enc.z));
             return vec4(res * a, a);
+        }
+        case OP_LUMETRI_CURVES: {
+            let o = ld(p);
+            if o.a <= 1e-6 {
+                return o;
+            }
+            return vec4(lumetri_curves(o.rgb / o.a) * o.a, o.a);
+        }
+        case OP_ULTRA_KEY: {
+            return ultra_key(ld(p));
         }
         case OP_LUMETRI: {
             let o = ld(p);

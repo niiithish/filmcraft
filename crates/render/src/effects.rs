@@ -1335,8 +1335,24 @@ pub fn apply_look(look: u32, c: [f32; 3]) -> [f32; 3] {
     }
 }
 
+/// Entries of Lumetri's curve tables.
+pub(crate) const LUMETRI_CURVE_N: usize = 1024;
+
+/// A curve table at `x` (clamped to 0…1), linearly interpolated between entries.
+#[inline]
+pub(crate) fn sample_curve_lut(l: &[f32], x: f32) -> f32 {
+    let Some(last) = l.len().checked_sub(1) else { return x };
+    let p = x.clamp(0.0, 1.0) * last as f32;
+    let i = (p as usize).min(last);
+    let j = (i + 1).min(last);
+    match (l.get(i), l.get(j)) {
+        (Some(a), Some(b)) => a + (b - a) * (p - i as f32),
+        _ => x,
+    }
+}
+
 fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
-    const N: usize = 1024;
+    const N: usize = LUMETRI_CURVE_N;
     let (creative_on, curves_on, wheels_on) = (on(e, "creative_on"), on(e, "curves_on"), on(e, "wheels_on"));
     let lut = |id: &str| curve_param(e, id).filter(|c| curves_on && !is_identity_curve(c)).map(|c| curve_lut(&c, N));
     let (luma_c, red_c, green_c, blue_c) = (lut("curve_luma"), lut("curve_red"), lut("curve_green"), lut("curve_blue"));
@@ -1374,10 +1390,7 @@ fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         if hdr && x > 1.0 {
             return l[N - 1] + (x - 1.0);
         }
-        let p = x.clamp(0.0, 1.0) * (N - 1) as f32;
-        let i = p as usize;
-        let j = (i + 1).min(N - 1);
-        l[i] + (l[j] - l[i]) * (p - i as f32)
+        sample_curve_lut(l, x)
     };
     img.map_rgb(|c, _, _| {
         let mut v = gs.encode(c);
@@ -1765,6 +1778,27 @@ mod lumetri_cpu_parity_tests {
                     ("tint", fl(-100.0)),
                     ("whites", fl(-100.0)),
                     ("blacks", fl(-100.0)),
+                ],
+            ),
+            (
+                // a warm grade over RGB curves (curves run in their own pass after the basic one)
+                "rgb_curves",
+                vec![
+                    ("contrast", fl(10.0)),
+                    ("saturation", fl(110.0)),
+                    ("curves_on", ParamValue::Bool(true)),
+                    ("curve_red", ParamValue::Curve(vec![[0.0, 0.0], [0.718, 0.732], [1.0, 1.0]])),
+                    ("curve_green", ParamValue::Curve(vec![[0.0, 0.0], [0.537, 0.549], [1.0, 1.0]])),
+                    ("curve_blue", ParamValue::Curve(vec![[0.0, 0.0], [0.423, 0.453], [1.0, 1.0]])),
+                ],
+            ),
+            (
+                "luma_curve",
+                vec![
+                    ("basic_on", ParamValue::Bool(false)),
+                    ("curves_on", ParamValue::Bool(true)),
+                    ("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [0.25, 0.15], [0.75, 0.9], [1.0, 0.95]])),
+                    ("curve_blue", ParamValue::Curve(vec![[0.0, 0.05], [1.0, 0.9]])),
                 ],
             ),
         ];

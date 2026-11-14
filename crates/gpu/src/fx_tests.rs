@@ -359,6 +359,52 @@ fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
             ],
             false,
         ),
+        (
+            "lumetri",
+            vec![
+                ("contrast", fl(10.0)),
+                ("curves_on", ParamValue::Bool(true)),
+                ("curve_red", ParamValue::Curve(vec![[0.0, 0.0], [0.718, 0.732], [1.0, 1.0]])),
+                ("curve_green", ParamValue::Curve(vec![[0.0, 0.0], [0.537, 0.549], [1.0, 1.0]])),
+                ("curve_blue", ParamValue::Curve(vec![[0.0, 0.0], [0.423, 0.453], [1.0, 1.0]])),
+            ],
+            false,
+        ),
+        (
+            "lumetri",
+            vec![
+                ("basic_on", ParamValue::Bool(false)),
+                ("curves_on", ParamValue::Bool(true)),
+                ("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [0.25, 0.15], [0.75, 0.9], [1.0, 0.95]])),
+                ("curve_blue", ParamValue::Curve(vec![[0.0, 0.05], [1.0, 0.9]])),
+            ],
+            false,
+        ),
+        // Ultra Key without Choke / Soften (the blurring cleanup stays on the CPU)
+        ("ultra_key", vec![("key_color", col(0.0, 0.7137, 0.3451))], false),
+        ("ultra_key", vec![("key_color", col(0.1, 0.25, 0.9))], false),
+        ("ultra_key", vec![("key_color", col(0.9, 0.2, 0.1)), ("cc_saturation", fl(140.0)), ("cc_hue", fl(-30.0)), ("cc_luminance", fl(80.0))], false),
+        (
+            "ultra_key",
+            vec![
+                ("setting", ch(3)),
+                ("key_color", col(0.2, 0.8, 0.3)),
+                ("transparency", fl(70.0)),
+                ("highlight", fl(40.0)),
+                ("shadow", fl(80.0)),
+                ("tolerance", fl(20.0)),
+                ("pedestal", fl(30.0)),
+                ("contrast", fl(40.0)),
+                ("mid_point", fl(30.0)),
+                ("spill", fl(90.0)),
+                ("desaturate", fl(70.0)),
+                ("range", fl(20.0)),
+                ("spill_luma", fl(80.0)),
+            ],
+            false,
+        ),
+        ("ultra_key", vec![("key_color", col(0.0, 0.7137, 0.3451)), ("output", ch(1))], false),
+        ("ultra_key", vec![("key_color", col(0.0, 0.7137, 0.3451)), ("output", ch(2))], false),
     ]
 }
 
@@ -665,10 +711,10 @@ fn lumetri_unsupported_sections_fall_back() {
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
     assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
 
-    // curve_luma modified
+    // RGB curves run on the GPU (OP_LUMETRI_CURVES); the HSL curves below still fall back
     let e = effect("lumetri", &[("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))]);
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    assert!(op.as_ref().is_some_and(|o| o.gpu_ok()));
 
     // hue_vs_sat non-empty
     let e = effect("lumetri", &[("hue_vs_sat", ParamValue::Curve(vec![[0.5, 0.5]]))]);
