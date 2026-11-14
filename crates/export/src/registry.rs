@@ -83,6 +83,11 @@ pub trait VideoEncoder: Send {
     fn accepts_yuv420(&self) -> bool {
         false
     }
+    /// The hardware encoder doing the work ("NVENC", "VideoToolbox"), `None` for FilmCraft's own
+    /// software encoders: what the export's [`crate::Report::encoder`] names.
+    fn hardware(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Audio encoder (AAC) plugged in by codec crates; PCM is built in.
