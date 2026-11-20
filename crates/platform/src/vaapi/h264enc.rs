@@ -434,6 +434,12 @@ impl VideoEncoder for VaH264Encoder {
     fn accepts_yuv420(&self) -> bool {
         true
     }
+
+    /// The export report names the encoder that ran; without this it says "software" and
+    /// repeats NVENC's decline reason although VA-API encoded the file.
+    fn hardware(&self) -> Option<&'static str> {
+        Some("VA-API")
+    }
 }
 
 /// Whether this machine's VA-API driver encodes H.264 (Main or High, CBR or VBR); checked once.
@@ -484,6 +490,17 @@ mod tests {
 
     fn cfg(s: &ExportSettings, w: u32, h: u32) -> std::result::Result<Config, String> {
         config(Format::H264, w, h, FrameRate::FPS_30, s, &CAPS)
+    }
+
+    /// On a machine with a VA-API H.264 encoder, the export report must say VA-API ran.
+    #[test]
+    fn a_taken_export_reports_va_api() {
+        if !available() {
+            return;
+        }
+        let s = ExportSettings { bitrate_kbps: 6000, max_bitrate_kbps: Some(9000), ..auto() };
+        let Some(Ok(enc)) = factory(Format::H264, 1080, 1920, FrameRate::FPS_24, &s) else { return };
+        assert_eq!(enc.hardware(), Some("VA-API"));
     }
 
     #[test]
